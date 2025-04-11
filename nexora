@@ -1,0 +1,239 @@
+#!/bin/bash
+
+set -euo pipefail
+
+COLOR_RESET='\e[0m'
+COLOR_GREEN='\e[32m'
+COLOR_RED='\e[31m'
+COLOR_YELLOW='\e[33m'
+
+log_info() {
+    printf "${COLOR_GREEN}info:${COLOR_RESET} %s\n" "$(echo "$@" | tr '[:upper:]' '[:lower:]')"
+}
+
+log_error() {
+    printf "${COLOR_RED}error:${COLOR_RESET} %s\n" "$(echo "$@" | tr '[:upper:]' '[:lower:]')" >&2
+}
+
+log_warn() {
+    printf "${COLOR_YELLOW}warning:${COLOR_RESET} %s\n" "$(echo "$@" | tr '[:upper:]' '[:lower:]')" >&2
+}
+
+error_handler() {
+  local exit_code=$1
+  local line_no=$2
+  log_error "script failed on line $line_no with exit code $exit_code"
+  exit "$exit_code"
+}
+
+trap 'error_handler $? $LINENO' ERR
+
+log_info "nexora started"
+
+if [[ -f ".env" ]]; then
+    log_info "sourcing environment variables from .env"
+    source ./.env
+fi
+
+activate_venv() {
+    log_info "activating python virtual environment"
+    if [ ! -d ".venv" ]; then
+        log_info "virtual environment not found, creating..."
+        python3 -m venv .venv
+        log_info "activating new virtual environment"
+        source .venv/bin/activate
+        log_info "installing requirements from requirements.txt"
+        pip install -r requirements.txt
+        log_info "requirements installed"
+    else
+        log_info "activating existing virtual environment"
+        source .venv/bin/activate
+    fi
+    log_info "python virtual environment activated"
+}
+
+run_remote_ssh() {
+    local user="$1"
+    local ip="$2"
+    local port="${3:-22}"
+    local remote_commands="$4"
+    log_info "executing remote commands on $ip:$port as user $user"
+    ssh -p "$port" -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "${user}@${ip}" "bash -s" <<< "$remote_commands"
+    log_info "remote commands executed successfully on $ip"
+}
+
+wormhole_init() {
+    local ip=$1
+    local ssh_port="3022"
+    log_info "initializing wormhole server at $ip"
+
+    local commands=$(cat <<-EOF
+		set -e
+		echo 'running wormhole init commands...'
+		sudo sed -i 's/#*Port 22/Port ${ssh_port}/g' /etc/ssh/sshd_config
+		sudo systemctl restart sshd
+		sudo mkdir -p /root/.ssh
+		sudo cp /home/debian/.ssh/authorized_keys /root/.ssh/authorized_keys
+		sudo chmod 600 /root/.ssh/authorized_keys
+		sudo chown root:root /root/.ssh/authorized_keys
+		echo 'wormhole init commands finished.'
+	EOF
+    )
+
+    local attempt=1
+    local max_attempts=5
+    local success=false
+    while [[ $attempt -le $max_attempts ]]; do
+        log_info "attempting wormhole init (attempt $attempt/$max_attempts) on $ip..."
+        if run_remote_ssh "debian" "$ip" "22" "$commands"; then
+            log_info "wormhole init successful on $ip"
+            success=true
+            break
+        else
+            log_error "wormhole init attempt $attempt failed on $ip (ssh exit code: $?). check connectivity/permissions."
+            attempt=$((attempt + 1))
+            if [[ $attempt -le $max_attempts ]]; then
+                log_info "retrying in 5 seconds..."
+                sleep 5
+            fi
+        fi
+    done
+
+    if [[ "$success" != true ]]; then
+        log_error "failed to initialize wormhole server $ip after $max_attempts attempts"
+        return 1
+    fi
+}
+
+stargate_init() {
+    local ip=$1
+    local ssh_port="3022"
+    log_info "initializing stargate server at $ip"
+
+    local commands=$(cat <<-EOF
+		set -e
+		echo 'running stargate init commands...'
+		sudo sed -i 's/#*Port 22/Port ${ssh_port}/g' /etc/ssh/sshd_config
+		sudo systemctl restart sshd
+		echo 'stargate init commands finished.'
+	EOF
+    )
+
+    local attempt=1
+    local max_attempts=5
+    local success=false
+    while [[ $attempt -le $max_attempts ]]; do
+        log_info "attempting stargate init (attempt $attempt/$max_attempts) on $ip..."
+        if run_remote_ssh "root" "$ip" "22" "$commands"; then
+            log_info "stargate init successful on $ip"
+            success=true
+            break
+        else
+            log_error "stargate init attempt $attempt failed on $ip (ssh exit code: $?). check connectivity/permissions."
+            attempt=$((attempt + 1))
+            if [[ $attempt -le $max_attempts ]]; then
+                log_info "retrying in 5 seconds..."
+                sleep 5
+            fi
+        fi
+    done
+
+     if [[ "$success" != true ]]; then
+        log_error "failed to initialize stargate server $ip after $max_attempts attempts"
+        return 1
+    fi
+}
+
+wormhole() {
+    log_info "creating wormhole infrastructure"
+    ku iaas apply
+    log_info "wormhole infrastructure created, fetching state"
+    local ip
+    ip=$(ku state | jq -r 'to_entries[0].value.ip')
+    log_info "fetched wormhole ip: $ip"
+
+    log_info "updating ansible inventory for wormhole"
+    sed -i "/wormhole:/!b;n;s#ansible_host: .*#ansible_host: $ip#" nomad/inventory/hosts.yml
+    log_info "ansible inventory updated"
+
+    log_info "adding dns record for wormhole"
+    python3 dns.py add "$DOMAIN" "$ip"
+    log_info "dns record added"
+
+    wormhole_init "$ip"
+}
+
+stargate() {
+    log_info "initializing terraform for stargate"
+    if ! terraform init; then
+      log_warn "terraform init failed, but proceeding."
+    fi
+    log_info "applying terraform configuration for stargate"
+    terraform apply -auto-approve
+    log_info "stargate infrastructure created, fetching output"
+
+    local ip
+    ip=$(terraform output -raw public_ip)
+    log_info "fetched stargate ip: $ip"
+
+    log_info "updating ansible inventory for stargate"
+    sed -i "/stargate:/!b;n;s#ansible_host: .*#ansible_host: $ip#" nomad/inventory/hosts.yml # Error handled by trap
+    log_info "ansible inventory updated"
+
+    stargate_init "$ip"
+}
+
+check_ping() {
+    log_info "checking ansible connectivity to all hosts"
+    ansible all -i inventory/hosts.yml -m ping --timeout 1
+    log_info "ansible ping check completed"
+}
+
+up() {
+    log_info "starting 'up' process"
+    wormhole
+    stargate
+    
+    log_info "running ansible playbook for vpn setup"
+    (
+      cd nomad/ || exit 1
+      check_ping
+      ansible-playbook -i inventory/hosts.yml vpn.yml
+    )
+    log_info "ansible vpn playbook finished"
+    log_info "'up' process completed successfully"
+}
+
+down() {
+    log_info "starting 'down' process"
+    log_info "destroying wormhole infrastructure via ku"
+    ku iaas destroy
+    log_info "destroying stargate infrastructure via terraform"
+    terraform destroy -auto-approve
+    log_info "'down' process completed successfully"
+}
+
+if [ $# -eq 0 ]; then
+    log_error "no action specified. use 'up' or 'down'."
+    exit 1
+fi
+
+action="$1"
+log_info "action requested: $action"
+
+case "$action" in
+    up)
+        activate_venv
+        up
+        ;;
+    down)
+        down
+        ;;
+    *)
+        log_error "invalid action '$action'. use 'up' or 'down'."
+        exit 1
+        ;;
+esac
+
+log_info "nexora finished successfully"
+exit 0

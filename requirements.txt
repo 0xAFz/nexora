@@ -1,0 +1,6 @@
+ansible~=11.1.0
+annotated-types~=0.7.0
+cloudflare~=3.1.0
+pydantic~=2.9.2
+pydantic_core~=2.23.4
+PyYAML~=6.0.2
