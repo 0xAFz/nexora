@@ -1,0 +1,24 @@
+# .env
+.env
+
+# ku
+.kustate.json
+kubar.json
+
+# python venv
+.venv
+venv
+env
+
+# nomad
+nomad/
+
+# terraform
+.terraform.lock.*
+.terraform/
+terraform.tfstate
+terraform.tfstate.*
+terraform.*
+
+# editor
+.vscode
