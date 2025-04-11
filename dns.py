@@ -71,7 +71,7 @@ def update_dns_record(cf: Cloudflare, zone_id: str, dns_record_id: str, record_t
             content=content,
             proxied=proxied,
         )
-        print(f"Successfully updated record.")
+        print("Successfully updated record.")
         return updated_record
     except APIError as e:
         print(f"Error updating DNS record: {e}", file=sys.stderr)
