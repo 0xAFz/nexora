@@ -147,10 +147,10 @@ stargate_init() {
 wormhole() {
     log_info "creating wormhole infrastructure"
     ku iaas apply
-    log_info "wormhole infrastructure created, fetching state"
+    log_info "wormhole infrastructure created"
     local ip
     ip=$(ku state | jq -r 'to_entries[0].value.ip')
-    log_info "fetched wormhole ip: $ip"
+    log_info "wormhole ip: $ip"
 
     log_info "updating ansible inventory for wormhole"
     sed -i "/wormhole:/!b;n;s#ansible_host: .*#ansible_host: $ip#" nomad/inventory/hosts.yml
@@ -170,14 +170,14 @@ stargate() {
     fi
     log_info "applying terraform configuration for stargate"
     terraform apply -auto-approve
-    log_info "stargate infrastructure created, fetching output"
+    log_info "stargate infrastructure created"
 
     local ip
     ip=$(terraform output -raw public_ip)
-    log_info "fetched stargate ip: $ip"
+    log_info "stargate ip: $ip"
 
     log_info "updating ansible inventory for stargate"
-    sed -i "/stargate:/!b;n;s#ansible_host: .*#ansible_host: $ip#" nomad/inventory/hosts.yml # Error handled by trap
+    sed -i "/stargate:/!b;n;s#ansible_host: .*#ansible_host: $ip#" nomad/inventory/hosts.yml
     log_info "ansible inventory updated"
 
     stargate_init "$ip"
@@ -206,9 +206,9 @@ up() {
 
 down() {
     log_info "starting 'down' process"
-    log_info "destroying wormhole infrastructure via ku"
+    log_info "destroying wormhole infrastructure"
     ku iaas destroy
-    log_info "destroying stargate infrastructure via terraform"
+    log_info "destroying stargate infrastructure"
     terraform destroy -auto-approve
     log_info "'down' process completed successfully"
 }
